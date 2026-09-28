@@ -38,6 +38,17 @@ facetrack_enabled_prev = None
 # Emotions such as "sad"/"happy" must NOT stop the mouth animation.
 speech_active = False
 
+# Sleep torque release:
+#   - only the real XiaoZhi "idle" state is allowed to release the servos
+#   - first let every active servo settle at pose_sleep
+#   - hold that settled pose briefly, then raise PCA9685 nOE (GPIO8)
+#   - any non-idle state, MCP action, or Calibration Mode wakes outputs first
+#
+# nOE only disables PWM; it does NOT cut the servo 5 V rail.
+SLEEP_TORQUE_RELEASE_DELAY_MS = 500
+servo_outputs_enabled = False
+sleep_settled_since = None
+
 # These device states explicitly mean the assistant is no longer speaking.
 SPEECH_STOP_SIGNALS = (
     "neutral",
@@ -63,6 +74,89 @@ last_wiggle_update = time.ticks_ms()
 
 # Filled from animation.pose_calibrate after PCA/Servo objects exist.
 calibration_home = {}
+
+
+def _all_active_servos_settled():
+    """Return True only when every enabled servo has reached its target."""
+    for servo in servos.values():
+        if not servo.enabled:
+            continue
+
+        if abs(servo.target - servo.pos) > servo.pos_tolerance:
+            return False
+
+        if abs(servo.vel) > servo.vel_tolerance:
+            return False
+
+    return True
+
+
+def _enable_servo_outputs(reason):
+    """Idempotently restore PCA9685 PWM output before any active behavior."""
+    global servo_outputs_enabled
+    global sleep_settled_since
+
+    sleep_settled_since = None
+
+    if servo_outputs_enabled:
+        return True
+
+    if servoclass.enable_outputs():
+        servo_outputs_enabled = True
+        print("[SLEEP] servo outputs ENABLED ({})".format(reason))
+        return True
+
+    return False
+
+
+def _update_sleep_torque_release(now, calibration_owns_servos, mcp_owns_servos):
+    """
+    Release all servo holding torque after the real idle pose has settled.
+
+    This intentionally changes only PCA9685 nOE. Servo targets, motion state,
+    animations, Vision AI, UART handling, and calibration behavior are left
+    untouched.
+    """
+    global servo_outputs_enabled
+    global sleep_settled_since
+
+    # Never release while a higher-priority local owner is active.
+    if (
+        animation.current_state != "idle"
+        or calibration_owns_servos
+        or mcp_owns_servos
+    ):
+        sleep_settled_since = None
+        return
+
+    # Already asleep with PWM disabled: nothing else to do.
+    if not servo_outputs_enabled:
+        return
+
+    # Wait until pose_sleep has actually arrived, including velocity settling.
+    if not _all_active_servos_settled():
+        sleep_settled_since = None
+        return
+
+    if sleep_settled_since is None:
+        sleep_settled_since = now
+        print(
+            "[SLEEP] idle pose settled; holding {} ms before torque release".format(
+                SLEEP_TORQUE_RELEASE_DELAY_MS
+            )
+        )
+        return
+
+    if (
+        time.ticks_diff(now, sleep_settled_since)
+        < SLEEP_TORQUE_RELEASE_DELAY_MS
+    ):
+        return
+
+    servoclass.disable_outputs()
+    servo_outputs_enabled = False
+    sleep_settled_since = None
+    print("[SLEEP] idle -> all servo holding torque RELEASED")
 
 
 def _clamp(value, low, high):
@@ -311,7 +405,7 @@ print(
     )
 )
 
-servoclass.enable_outputs()
+servo_outputs_enabled = servoclass.enable_outputs()
 
 # Build the initial home table once; it is refreshed every time
 # Calibration Mode is entered.
@@ -335,8 +429,15 @@ while True:
             # owns the requested action for exactly 2 seconds.
             if rcvstate.startswith("action:"):
                 action_name = rcvstate[7:].strip()
+                _enable_servo_outputs("MCP action {}".format(action_name))
                 animation.start_mcp_action(action_name, now)
                 continue
+
+            # Any real non-idle XiaoZhi state wakes the servos before its
+            # normal state/action logic runs. "idle" deliberately stays
+            # enabled until pose_sleep has settled and the release delay ends.
+            if rcvstate != "idle" and rcvstate in animation.state_map:
+                _enable_servo_outputs("state {}".format(rcvstate))
 
             # Speech activity and expression are two separate dimensions.
             # "speaking" starts the mouth animation.
@@ -374,8 +475,13 @@ while True:
                     print("same state ignored:", rcvstate)
 
     # Calibration retains absolute priority over every servo command.
+    # Wake PWM before Calibration Mode issues any servo command.
+    if mode.value() == 0:
+        _enable_servo_outputs("Calibration Mode")
+
     # --- START TEMPORARY ANIMATION TEST OVERRIDE ---
     calibration_owns_servos = _update_calibration_wiggle(now)
+    mcp_owns_servos = False
 
 
     if calibration_owns_servos:
@@ -450,6 +556,15 @@ while True:
     # by set_immediate(). During non-wiggle calibration it moves toward home.
     for s in servos.values():
         s.update(dt)
+
+    # Run this only after Servo.update(), so "settled" reflects the real
+    # end-of-loop motion state. It changes only PCA9685 nOE and therefore
+    # leaves all existing animation/vision/calibration logic intact.
+    _update_sleep_torque_release(
+        now,
+        calibration_owns_servos,
+        mcp_owns_servos,
+    )
 
     time.sleep_ms(1)
 
