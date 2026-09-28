@@ -26,6 +26,19 @@ A dual-MCU animatronics and AI processing platform combining an ESP32-S3 for mac
 
 <img width="1513" height="1492" alt="image" src="https://github.com/user-attachments/assets/3583c5b2-1953-4ada-817a-bcface599220" />
 
+### 3.1 Default Servo Wiring
+
+| Named Servo | Key in Code | Socket Number (Also PCA9685 Pin No.) |
+| --- | --- | --- |
+| Right Ear | "EAR" | 0 |
+| Left Ear | "EAL" | 1 |
+| Eyelid | "LID" | 2 |
+| Mouth | "MOU" | 3 |
+| Right Eye | "EYR" | 5 |
+| Left Eye | "EYL" | 4 |
+| Neck Pitch | "PIT" | 8 |
+| Neck Roll | "ROL" | 9 |
+| Base Yaw | "YAW" | 10 |
 
 ---
 
